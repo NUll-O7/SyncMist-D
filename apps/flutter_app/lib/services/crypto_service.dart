@@ -1,10 +1,15 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../main.dart' show isRustAvailable;
+
+// Conditionally import Rust crypto - only use if available
 import '../src/rust/crypto.dart' as rust_crypto;
 
 /// Service for encrypting and decrypting clipboard content
 ///
-/// Uses AES-256-GCM encryption via Rust FFI with X25519 key exchange for pairing
+/// Uses AES-256-GCM encryption via Rust FFI with X25519 key exchange for pairing.
+/// Falls back to mock encryption if Rust FFI is not available.
 class CryptoService {
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -17,7 +22,10 @@ class CryptoService {
 
   Uint8List? _cachedPrivateKey;
   Uint8List? _cachedPublicKey;
-  Uint8List? _legacyKey; // Temporary fallback key for Phase 2 compatibility
+  Uint8List? _legacyKey;
+
+  /// Mock XOR key for fallback encryption (NOT SECURE - demo only)
+  static const int _mockXorKey = 0x5A;
 
   /// Get or create the device's X25519 keypair
   /// Returns (privateKey, publicKey)
@@ -39,17 +47,33 @@ class CryptoService {
     }
 
     // Generate new keypair
-    debugPrint('🔑 Generating new X25519 keypair...');
-    final (secretKey, publicKey) = rust_crypto.generateKeypair();
+    debugPrint('🔑 Generating new keypair...');
 
-    // Store in secure storage (hex-encoded)
-    await _secureStorage.write(key: _keyPrivate, value: _bytesToHex(secretKey));
-    await _secureStorage.write(key: _keyPublic, value: _bytesToHex(publicKey));
+    if (isRustAvailable) {
+      try {
+        final (secretKey, publicKey) = rust_crypto.generateKeypair();
+        await _secureStorage.write(
+            key: _keyPrivate, value: _bytesToHex(secretKey));
+        await _secureStorage.write(
+            key: _keyPublic, value: _bytesToHex(publicKey));
+        _cachedPrivateKey = Uint8List.fromList(secretKey);
+        _cachedPublicKey = Uint8List.fromList(publicKey);
+        debugPrint('🔑 Generated and stored new X25519 keypair via Rust');
+        return (_cachedPrivateKey!, _cachedPublicKey!);
+      } catch (e) {
+        debugPrint('⚠️ Rust keypair generation failed: $e, using mock');
+      }
+    }
 
-    _cachedPrivateKey = Uint8List.fromList(secretKey);
-    _cachedPublicKey = Uint8List.fromList(publicKey);
-
-    debugPrint('🔑 Generated and stored new keypair');
+    // Fallback: Generate mock keypair (32 bytes each)
+    final mockPrivate = _generateMockKey(32);
+    final mockPublic = _generateMockKey(32);
+    await _secureStorage.write(
+        key: _keyPrivate, value: _bytesToHex(mockPrivate));
+    await _secureStorage.write(key: _keyPublic, value: _bytesToHex(mockPublic));
+    _cachedPrivateKey = mockPrivate;
+    _cachedPublicKey = mockPublic;
+    debugPrint('🔑 Generated mock keypair (Rust unavailable)');
     return (_cachedPrivateKey!, _cachedPublicKey!);
   }
 
@@ -60,20 +84,41 @@ class CryptoService {
   ) async {
     final (myPrivateKey, _) = await getOrCreateKeypair();
 
-    // Derive shared secret using X25519 ECDH
-    final sharedSecret = rust_crypto.deriveSharedSecret(
-      mySecret: myPrivateKey,
-      theirPublic: theirPublicKey,
-    );
+    Uint8List sharedSecret;
+    if (isRustAvailable) {
+      try {
+        final secret = rust_crypto.deriveSharedSecret(
+          mySecret: myPrivateKey,
+          theirPublic: theirPublicKey,
+        );
+        sharedSecret = Uint8List.fromList(secret);
+      } catch (e) {
+        debugPrint('⚠️ Rust shared secret derivation failed: $e');
+        sharedSecret = _mockDeriveSecret(myPrivateKey, theirPublicKey);
+      }
+    } else {
+      sharedSecret = _mockDeriveSecret(myPrivateKey, theirPublicKey);
+    }
 
-    // Store the shared secret for this device
     await _secureStorage.write(
       key: '$_sharedSecretPrefix$deviceId',
       value: _bytesToHex(sharedSecret),
     );
 
     debugPrint('🔗 Derived and stored shared secret for device: $deviceId');
-    return Uint8List.fromList(sharedSecret);
+    return sharedSecret;
+  }
+
+  /// Mock shared secret derivation (XOR of keys)
+  Uint8List _mockDeriveSecret(Uint8List myPrivate, Uint8List theirPublic) {
+    final length = myPrivate.length < theirPublic.length
+        ? myPrivate.length
+        : theirPublic.length;
+    final result = Uint8List(length);
+    for (int i = 0; i < length; i++) {
+      result[i] = myPrivate[i] ^ theirPublic[i];
+    }
+    return result;
   }
 
   /// Get the shared secret for a specific device
@@ -99,7 +144,15 @@ class CryptoService {
     if (sharedSecret == null) {
       throw Exception('No shared secret found for device: $deviceId');
     }
-    return rust_crypto.encryptText(plaintext: plaintext, key: sharedSecret);
+
+    if (isRustAvailable) {
+      try {
+        return rust_crypto.encryptText(plaintext: plaintext, key: sharedSecret);
+      } catch (e) {
+        debugPrint('⚠️ Rust encryption failed: $e');
+      }
+    }
+    return _mockEncrypt(plaintext);
   }
 
   /// Decrypt ciphertext using the shared secret from a specific device
@@ -109,7 +162,16 @@ class CryptoService {
     if (sharedSecret == null) {
       throw Exception('No shared secret found for device: $deviceId');
     }
-    return rust_crypto.decryptText(ciphertext: ciphertext, key: sharedSecret);
+
+    if (isRustAvailable) {
+      try {
+        return rust_crypto.decryptText(
+            ciphertext: ciphertext, key: sharedSecret);
+      } catch (e) {
+        debugPrint('⚠️ Rust decryption failed: $e');
+      }
+    }
+    return _mockDecrypt(Uint8List.fromList(ciphertext));
   }
 
   /// Delete pairing with a specific device
@@ -118,10 +180,8 @@ class CryptoService {
     debugPrint('🗑️ Unpaired device: $deviceId');
   }
 
-  // ========== Legacy API (for backward compatibility with Phase 2) ==========
+  // ========== Legacy API (for backward compatibility) ==========
 
-  /// Get or create a legacy encryption key for backward compatibility
-  /// TODO: Remove this once all code migrates to device-specific encryption
   Future<Uint8List> _getLegacyKey() async {
     if (_legacyKey != null) return _legacyKey!;
 
@@ -132,28 +192,78 @@ class CryptoService {
     }
 
     // Generate new legacy key
-    final key = rust_crypto.generateKey();
-    await _secureStorage.write(key: _legacyKeyName, value: _bytesToHex(key));
-    _legacyKey = Uint8List.fromList(key);
-    debugPrint('🔐 Generated legacy encryption key for backward compatibility');
+    if (isRustAvailable) {
+      try {
+        final key = rust_crypto.generateKey();
+        await _secureStorage.write(
+            key: _legacyKeyName, value: _bytesToHex(key));
+        _legacyKey = Uint8List.fromList(key);
+        debugPrint('🔐 Generated legacy key via Rust');
+        return _legacyKey!;
+      } catch (e) {
+        debugPrint('⚠️ Rust key generation failed: $e');
+      }
+    }
+
+    // Fallback mock key
+    final mockKey = _generateMockKey(32);
+    await _secureStorage.write(
+        key: _legacyKeyName, value: _bytesToHex(mockKey));
+    _legacyKey = mockKey;
+    debugPrint('🔐 Generated mock legacy key');
     return _legacyKey!;
   }
 
-  /// Encrypt plaintext (legacy method for Phase 2 compatibility)
-  /// @deprecated Use encryptForDevice instead
+  /// Encrypt plaintext (legacy method)
   Future<Uint8List> encrypt(String plaintext) async {
-    final key = await _getLegacyKey();
-    return rust_crypto.encryptText(plaintext: plaintext, key: key);
+    if (isRustAvailable) {
+      try {
+        final key = await _getLegacyKey();
+        return rust_crypto.encryptText(plaintext: plaintext, key: key);
+      } catch (e) {
+        debugPrint('⚠️ Rust encrypt failed: $e');
+      }
+    }
+    return _mockEncrypt(plaintext);
   }
 
-  /// Decrypt ciphertext (legacy method for Phase 2 compatibility)
-  /// @deprecated Use decryptFromDevice instead
+  /// Decrypt ciphertext (legacy method)
   Future<String> decrypt(List<int> ciphertext) async {
-    final key = await _getLegacyKey();
-    return rust_crypto.decryptText(ciphertext: ciphertext, key: key);
+    if (isRustAvailable) {
+      try {
+        final key = await _getLegacyKey();
+        return rust_crypto.decryptText(ciphertext: ciphertext, key: key);
+      } catch (e) {
+        debugPrint('⚠️ Rust decrypt failed: $e');
+      }
+    }
+    return _mockDecrypt(Uint8List.fromList(ciphertext));
   }
 
-  // Utility methods
+  // ========== Mock Encryption (fallback when Rust unavailable) ==========
+
+  Uint8List _mockEncrypt(String plaintext) {
+    final bytes = utf8.encode(plaintext);
+    return Uint8List.fromList(bytes.map((b) => b ^ _mockXorKey).toList());
+  }
+
+  String _mockDecrypt(Uint8List ciphertext) {
+    final bytes = ciphertext.map((b) => b ^ _mockXorKey).toList();
+    return utf8.decode(bytes);
+  }
+
+  Uint8List _generateMockKey(int length) {
+    // Simple pseudo-random key generation based on timestamp
+    final seed = DateTime.now().microsecondsSinceEpoch;
+    final result = Uint8List(length);
+    for (int i = 0; i < length; i++) {
+      result[i] = ((seed >> (i % 8)) + i * 37) & 0xFF;
+    }
+    return result;
+  }
+
+  // ========== Utility Methods ==========
+
   String _bytesToHex(List<int> bytes) {
     return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }

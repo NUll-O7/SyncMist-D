@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../../main.dart' show isRustAvailable;
 import '../../src/rust/transport/quic.dart';
 import '../../src/rust/frb_generated.dart';
 
@@ -24,9 +25,15 @@ abstract class TransportInterface {
   Future<void> disconnect();
 
   /// Get the singleton instance of the transport.
-  /// Uses mock in test mode, real FFI otherwise.
-  static TransportInterface get instance =>
-      useMock ? MockTransport() : RustTransport();
+  /// Uses mock if:
+  /// - useMock is set to true (for testing)
+  /// - Rust FFI is not available (fallback mode)
+  static TransportInterface get instance {
+    if (useMock || !isRustAvailable) {
+      return MockTransport();
+    }
+    return RustTransport();
+  }
 }
 
 /// Represents a connection to a single peer.

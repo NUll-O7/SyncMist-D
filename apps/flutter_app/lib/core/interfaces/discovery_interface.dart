@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import '../../main.dart' show isRustAvailable;
 import '../../src/rust/discovery/mdns.dart' as rust_mdns;
 import '../../src/rust/frb_generated.dart';
 
@@ -73,9 +74,15 @@ abstract class DiscoveryInterface {
   Stream<List<PeerInfo>> get discoveredPeers;
 
   /// Get the singleton instance of the discovery service.
-  /// Uses mock in test mode, real FFI otherwise.
-  static DiscoveryInterface get instance =>
-      useMock ? MockDiscovery() : RustDiscovery();
+  /// Uses mock if:
+  /// - useMock is set to true (for testing)
+  /// - Rust FFI is not available (fallback mode)
+  static DiscoveryInterface get instance {
+    if (useMock || !isRustAvailable) {
+      return MockDiscovery();
+    }
+    return RustDiscovery();
+  }
 }
 
 /// Real Rust FFI implementation of DiscoveryInterface.

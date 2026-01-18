@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../main.dart' show isRustAvailable;
 import 'p2p_service.dart';
 import 'discovery_service.dart';
 import '../core/interfaces/discovery_interface.dart';
@@ -48,8 +49,15 @@ abstract class CryptoService {
   static bool useMock = false;
 
   /// Get the singleton instance.
-  static CryptoService get instance =>
-      useMock ? _MockCryptoService.instance : _RustCryptoService.instance;
+  /// Uses mock if:
+  /// - useMock is set to true (for testing)
+  /// - Rust FFI is not available (fallback mode)
+  static CryptoService get instance {
+    if (useMock || !isRustAvailable) {
+      return _MockCryptoService.instance;
+    }
+    return _RustCryptoService.instance;
+  }
 
   Uint8List encrypt(String plaintext);
   String decrypt(Uint8List ciphertext);
